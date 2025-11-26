@@ -1,0 +1,163 @@
+import streamlit as st
+from kafka import KafkaConsumer
+import json
+import os
+import threading
+import pandas as pd
+import matplotlib.pyplot as plt
+import xmltodict
+from collections import defaultdict
+from streamlit_aggrid import AgGrid, GridOptionsBuilder
+import time  # Для retry
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
+# In-memory storage
+orders_stats = defaultdict(list)  # {'order_id': [events]}
+users_stats = []  # list of user registrations
+
+
+def consume_orders():
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                'order-information-topic',
+                bootstrap_servers=bootstrap_servers,
+                auto_offset_reset='earliest',
+                enable_auto_commit=True,
+                group_id='statistic-group-orders',
+                value_deserializer=lambda x: x.decode('utf-8')  # Raw string
+            )
+            logger.info("Orders consumer connected")
+            for message in consumer:
+                try:
+                    data = json.loads(message.value)
+                    order_id = data.get('orderId')
+                    # Получение headers
+                    headers_dict = {k: v.decode('utf-8') for k, v in message.headers}
+                    event_type = headers_dict.get('event_type', '')
+
+                    # XML to JSON if data present
+                    if 'data' in data:
+                        json_data = xmltodict.parse(data['data'])['order']
+                    else:
+                        json_data = {}
+
+                    orders_stats[order_id].append({
+                        'timestamp': data.get('timestamp'),
+                        'event_type': event_type,
+                        'status': json_data.get('status'),
+                        'total_amount': json_data.get('total_amount')
+                    })
+                    logger.info(f"Processed order event for {order_id}")
+                except Exception as e:
+                    logger.error(f"Error parsing order message: {e}. Skipping message: {message.value}")
+                    continue
+            break
+        except Exception as e:
+            logger.error(f"Error connecting to Kafka for orders: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+
+
+def consume_users():
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                'customer-registered-topic',
+                bootstrap_servers=bootstrap_servers,
+                auto_offset_reset='earliest',
+                enable_auto_commit=True,
+                group_id='statistic-group-users',
+                value_deserializer=lambda x: x.decode('utf-8')  # Raw string
+            )
+            logger.info("Users consumer connected")
+            for message in consumer:
+                try:
+                    data = json.loads(message.value)
+                    customer_id = data.get('customerId')
+                    if 'data' in data:
+                        json_data = xmltodict.parse(data['data'])['customer']
+                    else:
+                        json_data = {}
+
+                    users_stats.append({
+                        'customerId': customer_id,
+                        'timestamp': data.get('createdAt'),
+                        'name': json_data.get('name'),
+                        'email': json_data.get('email'),
+                        'phone': json_data.get('phone')
+                    })
+                    logger.info(f"Processed user event for {customer_id}")
+                except Exception as e:
+                    logger.error(f"Error parsing user message: {e}. Skipping message: {message.value}")
+                    continue
+            break
+        except Exception as e:
+            logger.error(f"Error connecting to Kafka for users: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+
+
+# Start consumers in background
+threading.Thread(target=consume_orders, daemon=True).start()
+threading.Thread(target=consume_users, daemon=True).start()
+
+st.title("Statistic Service")
+
+tabs = st.tabs(["Регистрация пользователей", "Информация о заказах"])
+
+with tabs[0]:
+    if users_stats:
+        users_df = pd.DataFrame(users_stats)
+
+        # Material UI table with ag-grid
+        gb = GridOptionsBuilder.from_dataframe(users_df)
+        gb.configure_default_column(groupable=True, value=True, enableRowGroup=True, aggFunc='sum', editable=True)
+        gb.configure_grid_options(domLayout='normal')
+        grid_options = gb.build()
+        grid_options['theme'] = 'material'  # Material UI theme
+
+        AgGrid(users_df, gridOptions=grid_options, height=400, theme='material')
+    else:
+        st.write("Нет данных по регистрациям пользователей")
+
+with tabs[1]:
+    if orders_stats:
+        df_data = []
+        for k, events in orders_stats.items():
+            for event in events:
+                event['orderId'] = k
+                df_data.append(event)
+        orders_df = pd.DataFrame(df_data)
+
+        # Material UI table with ag-grid and color by event_type
+        gb = GridOptionsBuilder.from_dataframe(orders_df)
+        gb.configure_default_column(groupable=True, value=True, enableRowGroup=True, aggFunc='sum', editable=True)
+        gb.configure_grid_options(domLayout='normal')
+
+        # Cell style for event_type column
+        gb.configure_column("event_type", cellStyle={
+            'styleConditions': [
+                {
+                    'condition': "params.value == 'order_created' || params.value == 'order_updated' || params.value == 'order_closed'",
+                    'style': {'backgroundColor': 'lightgreen'}},
+                {'condition': "params.value == 'order_canceled' || params.value == 'error'",
+                 'style': {'backgroundColor': 'lightcoral'}},
+                {'condition': 'true', 'style': {'backgroundColor': 'lightblue'}}  # default
+            ]
+        })
+
+        grid_options = gb.build()
+        grid_options['theme'] = 'material'  # Material UI theme
+
+        AgGrid(orders_df, gridOptions=grid_options, height=400, theme='material')
+
+        # Example chart: Orders by status
+        fig, ax = plt.subplots()
+        orders_df['status'].value_counts().plot(kind='bar', ax=ax)
+        st.pyplot(fig)
+    else:
+        st.write("Нет данных по заказам")
